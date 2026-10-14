@@ -1,12 +1,16 @@
 package com.example.detectionsystem.hardware
 
 import android.R
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 
 // ==========================================
 // 1. AKILLI SAAT BİLDİRİM YÖNETİCİSİ
@@ -38,6 +42,10 @@ object WatchNotificationManager {
 
     @Synchronized
     fun sendWatchAlert(context: Context, title: String, message: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) return
+        if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return
         val currentTime = System.currentTimeMillis()
 
         // Soğuma Süresi (Cooldown) Kontrolü
@@ -45,7 +53,6 @@ object WatchNotificationManager {
             return // Süre dolmadıysa sessizce işlemi iptal et
         }
 
-        lastAlertTime = currentTime
 
         try {
             val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -62,6 +69,7 @@ object WatchNotificationManager {
                 .setVibrate(WatchAlertConstants.VIBRATION_PATTERN)
 
             notificationManager.notify(uniqueNotificationId, builder.build())
+            lastAlertTime = currentTime
             Log.i(WatchAlertConstants.LOG_TAG, "Saat titreşim uyarısı gönderildi (ID: $uniqueNotificationId)")
 
         } catch (e: Exception) {

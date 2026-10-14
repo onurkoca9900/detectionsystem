@@ -38,11 +38,16 @@ object EyeAspectRatioCalculator {
 
 /** Requires one continuous closure interval; an open-eye sample clears the timer. */
 class EyeClosureTracker(
-    private val closedDurationMs: Long = VisionThresholds.EYE_CLOSED_DURATION_MS
+    private val closedDurationMs: Long = VisionThresholds.EYE_CLOSED_DURATION_MS,
+    private val maxSampleGapMs: Long = 1_000L
 ) {
     private var closedStartTimeMs: Long? = null
+    private var lastSampleTimeMs: Long? = null
 
     fun update(ear: Float, timeMs: Long): Boolean {
+        val previousSampleTime = lastSampleTimeMs
+        if (previousSampleTime != null && timeMs - previousSampleTime !in 0L..maxSampleGapMs) reset()
+        lastSampleTimeMs = timeMs
         if (!VisionThresholds.isEyeClosed(ear)) {
             reset()
             return false
@@ -54,5 +59,6 @@ class EyeClosureTracker(
 
     fun reset() {
         closedStartTimeMs = null
+        lastSampleTimeMs = null
     }
 }

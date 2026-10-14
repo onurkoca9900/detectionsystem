@@ -7,6 +7,7 @@ import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -31,12 +32,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -61,6 +65,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.isActive
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
@@ -101,14 +106,13 @@ fun ModernDMSAppScreen(
     viewModel: DmsViewModel = hiltViewModel()
 ) {
     val context = LocalContext.current
-    val sharedPreferences = remember { context.getSharedPreferences(UIConstants.PREFS_NAME, Context.MODE_PRIVATE) }
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     // UI Durumları (State)
     var showSosDialog by remember { mutableStateOf(false) }
     var showCameraView by remember { mutableStateOf(true) }
     var isLightMode by remember { mutableStateOf(false) }
     var showHistoryScreen by remember { mutableStateOf(false) }
-    var currentEarValue by remember { mutableFloatStateOf(0.0f) }
 
     val voiceAssistant = remember { VoiceAssistantManager(context) }
     val savedSessions by viewModel.allSessions.collectAsState(initial = emptyList())
@@ -117,6 +121,7 @@ fun ModernDMSAppScreen(
     var hasCameraPermission by remember {
         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
     }
+    var hasRequestedCameraPermission by rememberSaveable { mutableStateOf(false) }
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = { hasCameraPermission = it }
@@ -126,17 +131,45 @@ fun ModernDMSAppScreen(
         onResult = { viewModel.onSmsPermissionResult(it) }
     )
 
+    val requestCameraAccess: () -> Unit = {
+        val activity = context as? ComponentActivity
+        if (hasRequestedCameraPermission && activity?.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) == false) {
+            context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+        } else {
+            hasRequestedCameraPermission = true
+            permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
     // Yaşam Döngüsü (Lifecycle)
     LaunchedEffect(Unit) {
-        if (!hasCameraPermission) permissionLauncher.launch(Manifest.permission.CAMERA)
+        if (!hasCameraPermission && !hasRequestedCameraPermission) requestCameraAccess()
         viewModel.startTracking()
 
-        val savedPhone = sharedPreferences.getString(UIConstants.PREF_SOS_PHONE, "") ?: ""
-        val savedName = sharedPreferences.getString(UIConstants.PREF_SOS_NAME, "") ?: ""
         viewModel.updateSmsPermission(
             ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
         )
-        viewModel.loadEmergencyContact(savedPhone, savedName)
+    }
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    hasCameraPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                    viewModel.updateSmsPermission(
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
+                    )
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    viewModel.pauseVisionTracking()
+                    viewModel.clearBraceletAlert()
+                    SoundAlarmManager.stopAlarm()
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     LaunchedEffect(viewModel.shouldRequestSmsPermission) {
@@ -152,6 +185,7 @@ fun ModernDMSAppScreen(
     DisposableEffect(Unit) {
         onDispose {
             voiceAssistant.stop()
+            viewModel.clearBraceletAlert()
             viewModel.stopTracking()
             SoundAlarmManager.stopAlarm()
         }
@@ -162,9 +196,20 @@ fun ModernDMSAppScreen(
         if (viewModel.isDanger || viewModel.isYawning) {
             VibrationManager.triggerVibration(context)
             SoundAlarmManager.startAlarm()
+            WatchNotificationManager.sendWatchAlert(
+                context,
+                if (viewModel.isDanger) "Smart DMS: Uyku uyarısı" else "Smart DMS: Yorgunluk uyarısı",
+                if (viewModel.isDanger) "Uzun süreli göz kapanması algılandı. Güvenli bir yerde durun."
+                    else "Esneme algılandı. Mola vermeyi değerlendirin."
+            )
         } else {
             SoundAlarmManager.stopAlarm()
         }
+    }
+
+    LaunchedEffect(viewModel.isDanger, viewModel.isYawning, viewModel.braceletState.supportsDirectAlerts) {
+        if (viewModel.isDanger || viewModel.isYawning) viewModel.alertBracelet()
+        else viewModel.clearBraceletAlert()
     }
 
     // Temel Renk ve Animasyonlar
@@ -196,17 +241,17 @@ fun ModernDMSAppScreen(
                     CameraOrRadarSection(
                         showCameraView = showCameraView,
                         hasCameraPermission = hasCameraPermission,
+                        onRequestCameraAccess = requestCameraAccess,
                         viewModel = viewModel,
                         voiceAssistant = voiceAssistant,
                         isLightMode = isLightMode,
-                        onEarUpdate = { currentEarValue = it }
                     )
                 }
                 // Sağ Taraf: Kontroller
                 Column(modifier = Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.SpaceBetween) {
                     TopBarSection(viewModel, isLightMode, activeColors, onHistoryClick = { showHistoryScreen = true }, onCameraToggle = { showCameraView = !showCameraView }, onThemeToggle = { isLightMode = !isLightMode }, onSosContactClick = { showSosDialog = true })
                     if (viewModel.showBreakSuggestion) BreakSuggestionCard(viewModel, context)
-                    TelemetryCard(currentEarValue, activeColors)
+                    TelemetryCard(viewModel.currentEar, activeColors)
                     SaveDriveButton(viewModel, context)
                 }
             }
@@ -226,15 +271,15 @@ fun ModernDMSAppScreen(
                     CameraOrRadarSection(
                         showCameraView = showCameraView,
                         hasCameraPermission = hasCameraPermission,
+                        onRequestCameraAccess = requestCameraAccess,
                         viewModel = viewModel,
                         voiceAssistant = voiceAssistant,
                         isLightMode = isLightMode,
-                        onEarUpdate = { currentEarValue = it }
                     )
                 }
 
                 Spacer(modifier = Modifier.height(16.dp))
-                TelemetryCard(currentEarValue, activeColors)
+                TelemetryCard(viewModel.currentEar, activeColors)
                 Spacer(modifier = Modifier.height(12.dp))
                 SaveDriveButton(viewModel, context)
                 Spacer(modifier = Modifier.height(24.dp))
@@ -242,6 +287,7 @@ fun ModernDMSAppScreen(
         }
 
         // Arayüz Üstü Bileşenler (Dialoglar)
+        DriveSaveErrorDialog(viewModel)
         BreakSuggestionDialog(viewModel = viewModel)
 
         if (showSosDialog) {
@@ -250,8 +296,7 @@ fun ModernDMSAppScreen(
                 initialPhone = viewModel.emergencyPhoneNumber,
                 onDismiss = { showSosDialog = false },
                 onSave = { name, phone ->
-                    sharedPreferences.edit().putString(UIConstants.PREF_SOS_NAME, name).putString(UIConstants.PREF_SOS_PHONE, phone).apply()
-                    viewModel.loadEmergencyContact(phone, name)
+                    viewModel.saveEmergencyContact(phone, name)
                     showSosDialog = false
                     if (phone.isNotBlank()) viewModel.requestSmsPermissionForContactSetup()
                 }
@@ -354,16 +399,15 @@ private fun BreakSuggestionCard(viewModel: DmsViewModel, context: Context) {
 private fun CameraOrRadarSection(
     showCameraView: Boolean,
     hasCameraPermission: Boolean,
+    onRequestCameraAccess: () -> Unit,
     viewModel: DmsViewModel,
     voiceAssistant: VoiceAssistantManager,
-    isLightMode: Boolean,
-    onEarUpdate: (Float) -> Unit
+    isLightMode: Boolean
 ) {
     if (showCameraView) {
         Box(modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(24.dp)).background(Color.Black), contentAlignment = Alignment.Center) {
             if (hasCameraPermission) {
                 CameraPreviewScreen { analysis ->
-                    onEarUpdate(analysis.currentEAR)
                     viewModel.updateVisionAnalysis(analysis, voiceAssistant)
                 }
                 val statusText = when (viewModel.visionStatus) {
@@ -383,19 +427,18 @@ private fun CameraOrRadarSection(
                     }
                 }
             } else {
-                Text(
-                    text = "Sürücü takibi için kamera izni gerekiyor.",
-                    color = Color.White,
-                    modifier = Modifier.padding(24.dp),
-                    textAlign = TextAlign.Center
-                )
+                Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("Sürücü takibi için kamera izni gerekiyor.", color = Color.White, textAlign = TextAlign.Center)
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(onClick = onRequestCameraAccess) { Text("Kamera erişimini aç") }
+                }
             }
         }
     } else {
         val radarColor = when {
             viewModel.isDanger -> UIConstants.ColorDangerBg
             viewModel.isYawning || viewModel.isDistracted -> UIConstants.ColorWarningText
-            else -> UIConstants.ColorSuccess
+            else -> Color.Gray
         }
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Surface(shape = CircleShape, color = radarColor.copy(alpha = if (isLightMode) 0.1f else 0.2f), modifier = Modifier.size(220.dp)) {
@@ -426,19 +469,38 @@ private fun TelemetryCard(earValue: Float, colors: AppColors) {
 
 @Composable
 private fun SaveDriveButton(viewModel: DmsViewModel, context: Context) {
+    val buttonScope = rememberCoroutineScope()
     Button(
         onClick = {
-            viewModel.finishAndSaveDrive() // Clean Code: DAO Hilt üzerinden yönetiliyor
-            Toast.makeText(context, "Sürüş başarıyla kaydedildi!", Toast.LENGTH_SHORT).show()
-            (context as? ComponentActivity)?.onBackPressedDispatcher?.onBackPressed()
+            viewModel.finishAndSaveDrive {
+                if (buttonScope.isActive) {
+                    Toast.makeText(context, "Sürüş başarıyla kaydedildi!", Toast.LENGTH_SHORT).show()
+                    (context as? ComponentActivity)?.onBackPressedDispatcher?.onBackPressed()
+                }
+            }
         },
+        enabled = !viewModel.isSavingDrive,
         modifier = Modifier.fillMaxWidth().height(55.dp),
         colors = ButtonDefaults.buttonColors(containerColor = UIConstants.ColorPrimaryAction),
         shape = RoundedCornerShape(16.dp)
     ) {
         Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color.White)
         Spacer(modifier = Modifier.width(8.dp))
-        Text(text = "Sürüşü Bitir ve Kaydet", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        Text(text = if (viewModel.isSavingDrive) "Kaydediliyor…" else "Sürüşü Bitir ve Kaydet", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+fun DriveSaveErrorDialog(viewModel: DmsViewModel) {
+    viewModel.driveSaveErrorMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = viewModel::dismissDriveSaveError,
+            title = { Text("Sürüş kaydı") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = viewModel::dismissDriveSaveError) { Text("Tamam") }
+            }
+        )
     }
 }
 
@@ -501,6 +563,7 @@ fun CameraPreviewScreen(onAnalysisUpdate: (VisionAnalysis) -> Unit) {
         }
     }
     val latestOnAnalysisUpdate by rememberUpdatedState(onAnalysisUpdate)
+    val mainExecutor = remember(context) { ContextCompat.getMainExecutor(context) }
 
     DisposableEffect(lifecycleOwner, cameraProviderFuture, analysisExecutor, previewView) {
         val disposed = AtomicBoolean(false)
@@ -515,7 +578,11 @@ fun CameraPreviewScreen(onAnalysisUpdate: (VisionAnalysis) -> Unit) {
                 boundCameraProvider = cameraProvider
 
                 val analyzer = EyeLandmarkAnalyzer(context) { result ->
-                    if (!disposed.get()) latestOnAnalysisUpdate(result)
+                    mainExecutor.execute {
+                        if (!disposed.get() && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                            latestOnAnalysisUpdate(result)
+                        }
+                    }
                 }
                 eyeAnalyzer = analyzer
 
@@ -571,9 +638,6 @@ object IntentUtils {
 
 object UIConstants {
     const val APP_TITLE = "Smart DMS"
-    const val PREFS_NAME = "DMS_PREFERENCES"
-    const val PREF_SOS_PHONE = "SOS_PHONE"
-    const val PREF_SOS_NAME = "SOS_NAME"
     const val LOG_TAG_CAMERA = "CameraX"
 
     const val EAR_CRITICAL_THRESHOLD = 0.21f

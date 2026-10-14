@@ -14,6 +14,7 @@ class VisionRulesTest {
         val tracker = EyeClosureTracker()
 
         assertFalse(tracker.update(0.20f, 1_000L))
+        assertFalse(tracker.update(0.20f, 2_000L))
         assertFalse(tracker.update(0.20f, 2_999L))
         assertTrue(tracker.update(0.20f, 3_000L))
     }
@@ -25,6 +26,7 @@ class VisionRulesTest {
         assertFalse(tracker.update(0.20f, 1_000L))
         assertFalse(tracker.update(VisionThresholds.EYE_CLOSED_EAR, 2_000L))
         assertFalse(tracker.update(0.20f, 3_500L))
+        assertFalse(tracker.update(0.20f, 4_500L))
         assertTrue(tracker.update(0.20f, 5_500L))
     }
 
@@ -36,6 +38,15 @@ class VisionRulesTest {
         assertFalse(VisionThresholds.isHeadDistracted(VisionThresholds.HEAD_YAW_RATIO_MAX))
         assertTrue(VisionThresholds.isHeadDistracted(VisionThresholds.HEAD_YAW_RATIO_MIN - 0.001f))
         assertTrue(VisionThresholds.isHeadDistracted(VisionThresholds.HEAD_YAW_RATIO_MAX + 0.001f))
+    }
+
+    @Test
+    fun aCameraPauseDoesNotCountAsObservedEyeClosure() {
+        val tracker = EyeClosureTracker()
+        assertFalse(tracker.update(0.20f, 1_000L))
+        assertFalse(tracker.update(0.20f, 8_000L))
+        assertFalse(tracker.update(0.20f, 9_000L))
+        assertTrue(tracker.update(0.20f, 10_000L))
     }
 
     @Test

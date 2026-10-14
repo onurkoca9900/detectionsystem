@@ -70,7 +70,7 @@ fun LoginScreen(
             onClick = {
                 if (email.isNotBlank() && password.isNotBlank()) {
                     isLoading = true
-                    auth.signInWithEmailAndPassword(email.trim(), password.trim()).addOnCompleteListener { task ->
+                    auth.signInWithEmailAndPassword(email.trim(), password).addOnCompleteListener { task ->
                         isLoading = false
                         if (task.isSuccessful) {
                             Toast.makeText(context, "Hoş Geldiniz!", Toast.LENGTH_SHORT).show()
@@ -139,7 +139,7 @@ fun SignUpScreen(
                     password.length < 6 -> Toast.makeText(context, "Şifre en az 6 karakter olmalı", Toast.LENGTH_SHORT).show()
                     else -> {
                         isLoading = true
-                        auth.createUserWithEmailAndPassword(email.trim(), password.trim()).addOnCompleteListener { task ->
+                        auth.createUserWithEmailAndPassword(email.trim(), password).addOnCompleteListener { task ->
                             isLoading = false
                             if (task.isSuccessful) {
                                 Toast.makeText(context, "Kayıt Başarılı! İçeri alınıyorsunuz.", Toast.LENGTH_SHORT).show()

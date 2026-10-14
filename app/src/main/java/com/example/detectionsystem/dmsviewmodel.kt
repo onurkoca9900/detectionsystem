@@ -12,6 +12,8 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.detectionsystem.data.DriveSessionMetrics
+import com.example.detectionsystem.data.AccountContactStore
+import com.example.detectionsystem.data.EmergencyContact
 import com.example.detectionsystem.data.DrivingDao
 import com.example.detectionsystem.data.DrivingSession
 import com.example.detectionsystem.hardware.BleBraceletManager
@@ -21,26 +23,40 @@ import com.example.detectionsystem.hardware.VoiceAssistantManager
 import com.example.detectionsystem.vision.FatigueRiskCalculator
 import com.example.detectionsystem.vision.VisionAnalysis
 import com.example.detectionsystem.vision.VisionStatus
+import com.google.firebase.auth.FirebaseAuth
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltViewModel
 class DmsViewModel @Inject constructor(
     private val drivingDao: DrivingDao,
+    private val auth: FirebaseAuth,
     @ApplicationContext context: Context
 ) : ViewModel() {
 
-    val allSessions = drivingDao.getAllSessions()
+    private val mutableSessions = MutableStateFlow<List<DrivingSession>>(emptyList())
+    val allSessions = mutableSessions.asStateFlow()
+    private val contactStore = AccountContactStore(context)
+    private var activeUserId: String? = null
+    private var sessionsJob: Job? = null
+    private val authListener = FirebaseAuth.AuthStateListener { updateActiveUser(it.currentUser?.uid) }
     private val braceletManager = BleBraceletManager(context)
 
     // ==========================================
     // 1. ARAYÜZ (UI) DURUM DEĞİŞKENLERİ
     // ==========================================
     var isTrackingActive by mutableStateOf(false)
+        private set
+    var isSavingDrive by mutableStateOf(false)
+        private set
+    var driveSaveErrorMessage by mutableStateOf<String?>(null)
         private set
     var braceletState by mutableStateOf(BleBraceletState())
         private set
@@ -99,6 +115,7 @@ class DmsViewModel @Inject constructor(
     private var lastRiskUpdateTime = 0L
 
     init {
+        auth.addAuthStateListener(authListener)
         viewModelScope.launch {
             braceletManager.state.collect { braceletState = it }
         }
@@ -108,6 +125,36 @@ class DmsViewModel @Inject constructor(
     // FONKSİYONLAR
     // ==========================================
 
+    private fun updateActiveUser(userId: String?) {
+        if (userId == activeUserId) return
+        stopTracking()
+        if (!isSavingDrive) saveCurrentDrive()
+        resetDriveSession()
+        sessionsJob?.cancel()
+        mutableSessions.value = emptyList()
+        braceletManager.stopScan()
+        braceletManager.disconnect()
+        emergencyPhoneNumber = ""
+        emergencyContactName = "Kayıtlı Kişi Yok"
+        driveSaveErrorMessage = null
+        activeUserId = userId
+
+        if (userId != null) {
+            val contact = contactStore.load(userId)
+            loadEmergencyContact(contact.phone, contact.name)
+            sessionsJob = viewModelScope.launch {
+                drivingDao.getSessionsForUser(userId).collect { sessions ->
+                    if (activeUserId == userId) mutableSessions.value = sessions
+                }
+            }
+        }
+    }
+
+    fun signOut() {
+        auth.signOut()
+        updateActiveUser(null)
+    }
+
     fun scanForBracelets() = braceletManager.startScan()
 
     fun stopBraceletScan() = braceletManager.stopScan()
@@ -115,6 +162,10 @@ class DmsViewModel @Inject constructor(
     fun connectToBracelet(address: String) = braceletManager.connect(address)
 
     fun disconnectBracelet() = braceletManager.disconnect()
+
+    fun alertBracelet() = braceletManager.sendFatigueAlert(isDanger)
+
+    fun clearBraceletAlert() = braceletManager.clearFatigueAlert()
 
     fun getFormattedDrivingTime(): String {
         val hours = drivingSeconds / 3600
@@ -126,15 +177,17 @@ class DmsViewModel @Inject constructor(
         }
     }
 
-    fun recalibrateEyeSensor() {
-        currentEar = DEFAULT_EAR
-        isDanger = false
-        updateFatigueRisk()
+    fun saveEmergencyContact(phone: String, name: String) {
+        val userId = activeUserId ?: return
+        if (auth.currentUser?.uid != userId) return
+        val contact = EmergencyContact(phone.trim(), name.trim())
+        contactStore.save(userId, contact)
+        loadEmergencyContact(contact.phone, contact.name)
     }
 
-    fun loadEmergencyContact(phone: String, name: String) {
+    private fun loadEmergencyContact(phone: String, name: String) {
         emergencyPhoneNumber = phone
-        emergencyContactName = name.ifBlank { "Acil Durum Kişisi" }
+        emergencyContactName = name.ifBlank { if (phone.isBlank()) "Kayıtlı Kişi Yok" else "Acil Durum Kişisi" }
         if (phone.isNotBlank() && sendSosAfterPermission) {
             if (isSmsPermissionGranted) {
                 sendSosAfterPermission = false
@@ -189,6 +242,7 @@ class DmsViewModel @Inject constructor(
     }
 
     fun updateVisionAnalysis(result: VisionAnalysis, voiceAssistant: VoiceAssistantManager?) {
+        if (!isTrackingActive || auth.currentUser?.uid != activeUserId) return
         visionStatus = result.status
         if (result.status != VisionStatus.TRACKING) {
             currentEar = 0f
@@ -236,15 +290,16 @@ class DmsViewModel @Inject constructor(
     ) {
         currentEar = ear
         currentMar = mar
-        val currentTime = System.currentTimeMillis()
+        val currentTime = SystemClock.elapsedRealtime()
 
         // 1. UYKU DURUMU (Öncelikli Risk)
         if (danger) {
             isDanger = true
             isYawning = false
             yawnStartTime = 0L
+            hasCountedCurrentYawn = false
 
-            if (currentTime - lastDangerTime > SLEEP_WARNING_COOLDOWN_MS) {
+            if (lastDangerTime == 0L || currentTime - lastDangerTime > SLEEP_WARNING_COOLDOWN_MS) {
                 sessionMetrics = sessionMetrics.copy(sleepWarningCount = sleepWarningCount + 1)
                 lastDangerTime = currentTime
             }
@@ -314,6 +369,8 @@ class DmsViewModel @Inject constructor(
     }
 
     fun startTracking() {
+        if (isSavingDrive) return
+        if (activeUserId == null || auth.currentUser?.uid != activeUserId) return
         if (isTrackingActive) return
         isTrackingActive = true
         timerJob = viewModelScope.launch {
@@ -327,36 +384,76 @@ class DmsViewModel @Inject constructor(
 
     fun stopTracking() {
         isTrackingActive = false
+        pauseVisionTracking()
         timerJob?.cancel()
         timerJob = null
     }
 
     // HİLT SAYESİNDE DAO DIŞARIDAN İSTENMİYOR
-    fun finishAndSaveDrive() {
+    fun finishAndSaveDrive(onSaved: () -> Unit) = saveAndResetDrive(startNew = false, onSaved)
+
+    /** Waits for the previous drive to be archived before opening a new session. */
+    fun startNewDrive(onStarted: () -> Unit) = saveAndResetDrive(startNew = true, onStarted)
+
+    private fun saveAndResetDrive(startNew: Boolean, onSaved: () -> Unit) {
+        if (isSavingDrive) return
+        val userId = activeUserId ?: return
+        if (auth.currentUser?.uid != userId) return
+        val metrics = sessionMetrics
+        isSavingDrive = true
+        driveSaveErrorMessage = null
         stopTracking()
-        saveCurrentDrive()
-        resetDriveSession()
+        viewModelScope.launch {
+            var saved = false
+            try {
+                if (metrics.hasActivity) drivingDao.insertSession(metrics.toDrivingSession(userId))
+                if (activeUserId == userId) {
+                    resetDriveSession()
+                    saved = true
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("DMS_HISTORY", "Drive could not be saved", e)
+                if (activeUserId == userId) driveSaveErrorMessage = "Sürüş kaydedilemedi. Kayıtlarınız korunuyor; yeniden deneyin."
+            } finally {
+                isSavingDrive = false
+            }
+            if (saved) {
+                if (startNew) startTracking()
+                onSaved()
+            }
+        }
     }
 
-    /** Archives an unfinished session before starting a clean, independent drive. */
-    fun startNewDrive() {
-        stopTracking()
-        saveCurrentDrive()
-        resetDriveSession()
-        startTracking()
+    fun dismissDriveSaveError() {
+        driveSaveErrorMessage = null
     }
 
     private fun saveCurrentDrive() {
+        val userId = activeUserId ?: return
         val metrics = sessionMetrics
         if (!metrics.hasActivity) return
 
-        val session = DrivingSession(
-            durationSeconds = metrics.durationSeconds,
-            yawnCount = metrics.yawnCount,
-            sleepWarningCount = metrics.sleepWarningCount
-        )
-        viewModelScope.launch { drivingDao.insertSession(session) }
+        val session = metrics.toDrivingSession(userId)
+        viewModelScope.launch {
+            try {
+                drivingDao.insertSession(session)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("DMS_HISTORY", "Unfinished drive could not be archived", e)
+                if (activeUserId == userId) driveSaveErrorMessage = "Önceki sürüş kaydedilemedi."
+            }
+        }
     }
+
+    private fun DriveSessionMetrics.toDrivingSession(userId: String) = DrivingSession(
+        durationSeconds = durationSeconds,
+        yawnCount = yawnCount,
+        sleepWarningCount = sleepWarningCount,
+        userId = userId
+    )
 
     private fun resetDriveSession() {
         sessionMetrics = sessionMetrics.cleared()
@@ -460,6 +557,7 @@ class DmsViewModel @Inject constructor(
     }
 
     override fun onCleared() {
+        auth.removeAuthStateListener(authListener)
         braceletManager.close()
         super.onCleared()
     }

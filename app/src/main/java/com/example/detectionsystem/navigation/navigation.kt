@@ -72,7 +72,6 @@ fun AppNavigation() {
                     navController.navigate("home") {
                         // Kayıt başarılı olursa login ve signup sayfalarını geçmişten sil
                         popUpTo("login") { inclusive = true }
-                        popUpTo("signup") { inclusive = true }
                     }
                 },
                 onNavigateBack = {

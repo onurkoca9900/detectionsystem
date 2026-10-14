@@ -28,13 +28,17 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.detectionsystem.DmsViewModel
+import com.example.detectionsystem.DriveSaveErrorDialog
 import com.example.detectionsystem.data.DrivingSession
 import com.example.detectionsystem.hardware.BleBraceletState
 import com.example.detectionsystem.hardware.BleBraceletStatus
+import com.example.detectionsystem.hardware.PermissionChecks
+import com.example.detectionsystem.vision.VisionStatus
 import com.google.firebase.auth.FirebaseAuth
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.isActive
 
 // ==========================================
 // 1. ANA EKRAN BİLEŞENİ
@@ -46,6 +50,7 @@ fun HomeScreen(
     viewModel: DmsViewModel = hiltViewModel() // Clean Code: Hilt Entegrasyonu
 ) {
     val context = LocalContext.current
+    val homeScope = rememberCoroutineScope()
     val currentUser = remember { FirebaseAuth.getInstance().currentUser }
     val userEmail = currentUser?.email ?: HomeConstants.DEFAULT_USER_NAME
 
@@ -64,13 +69,15 @@ fun HomeScreen(
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
         } else {
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         }
     }
     val bluetoothPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions(),
         onResult = { grantResults ->
-            bluetoothPermissionDenied = requiredBluetoothPermissions.any { grantResults[it] != true }
+            bluetoothPermissionDenied = !PermissionChecks.areAllGranted(requiredBluetoothPermissions, grantResults) {
+                ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+            }
             if (bluetoothPermissionDenied) viewModel.stopBraceletScan() else viewModel.scanForBracelets()
         }
     )
@@ -93,7 +100,7 @@ fun HomeScreen(
             HomeTopAppBar(
                 onGuideClick = { showOnboardingDialog.value = true },
                 onLogoutClick = {
-                    FirebaseAuth.getInstance().signOut()
+                    viewModel.signOut()
                     onLogoutSuccess()
                 }
             )
@@ -112,9 +119,10 @@ fun HomeScreen(
 
             WelcomeSection(userEmail, riskPercentage)
 
-            StartDriveButton(onStart = {
-                viewModel.startNewDrive()
-                onNavigateToCamera()
+            StartDriveButton(enabled = !viewModel.isSavingDrive, onStart = {
+                viewModel.startNewDrive {
+                    if (homeScope.isActive) onNavigateToCamera()
+                }
             })
 
             RiskRatioCard(riskPercentage = riskPercentage)
@@ -132,7 +140,7 @@ fun HomeScreen(
                 drivingTimeText = drivingTimeText
             )
 
-            AdviceCard(riskPercentage = riskPercentage)
+            AdviceCard(riskPercentage = riskPercentage, isMonitoringAvailable = viewModel.visionStatus == VisionStatus.TRACKING)
 
             SectionTitle(title = HomeConstants.TitleHistory)
 
@@ -155,6 +163,7 @@ fun HomeScreen(
             }
         )
     }
+    DriveSaveErrorDialog(viewModel)
 }
 
 // ==========================================
@@ -258,9 +267,10 @@ private fun WelcomeSection(userEmail: String, riskPercentage: Int) {
 }
 
 @Composable
-private fun StartDriveButton(onStart: () -> Unit) {
+private fun StartDriveButton(enabled: Boolean, onStart: () -> Unit) {
     Button(
         onClick = onStart,
+        enabled = enabled,
         modifier = Modifier.fillMaxWidth().height(75.dp),
         colors = ButtonDefaults.buttonColors(containerColor = HomeConstants.AccentColor),
         shape = RoundedCornerShape(20.dp),
@@ -268,7 +278,7 @@ private fun StartDriveButton(onStart: () -> Unit) {
     ) {
         Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black, modifier = Modifier.size(32.dp))
         Spacer(modifier = Modifier.width(12.dp))
-        Text(text = "Sürüş Takibini Başlat", color = Color.Black, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+        Text(text = if (enabled) "Sürüş Takibini Başlat" else "Kaydediliyor…", color = Color.Black, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
     }
 }
 
@@ -314,11 +324,11 @@ private fun TelemetryGridSection(
             InfoCard(
                 modifier = Modifier.weight(1f),
                 title = "Göz (EAR)",
-                subtitle = "EAR: ${String.format(Locale.US, "%.2f", viewModel.currentEar)} (Yenile)",
-                icon = Icons.Default.Refresh,
+                subtitle = if (viewModel.visionStatus == VisionStatus.TRACKING)
+                    "EAR: ${String.format(Locale.US, "%.2f", viewModel.currentEar)}" else "Sürüşte ölçülür",
+                icon = Icons.Default.Visibility,
                 containerColor = HomeConstants.CardColor,
-                contentColor = Color.White,
-                onClick = { viewModel.recalibrateEyeSensor() }
+                contentColor = Color.White
             )
         }
     }
@@ -398,11 +408,12 @@ fun InfoCard(modifier: Modifier = Modifier, title: String, subtitle: String, ico
 }
 
 @Composable
-fun AdviceCard(riskPercentage: Int) {
+fun AdviceCard(riskPercentage: Int, isMonitoringAvailable: Boolean) {
     val isCritical = riskPercentage >= HomeConstants.CRITICAL_RISK_THRESHOLD
     val isWarning = riskPercentage >= HomeConstants.WARNING_RISK_THRESHOLD
 
     val (adviceText, icon, color, bgColor) = when {
+        !isMonitoringAvailable -> listOf("Kamera takibi aktif değil. Sürüşü başlatıp yüzünüzün göründüğünü kontrol edin.", Icons.Default.VideocamOff, Color.LightGray, HomeConstants.CardColor)
         isCritical -> listOf("ACİL: Lütfen aracı güvenli bir yerde durdurun ve dinlenin!", Icons.Default.Warning, HomeConstants.DangerColor, HomeConstants.DangerBgColor)
         isWarning -> listOf("Dikkat: Yorgunluk belirtileri artıyor. Mola vermeyi düşünün.", Icons.Default.Info, HomeConstants.WarningColor, HomeConstants.CardColor)
         else -> listOf("Durum İyi: Sürüşe güvenle devam edebilirsiniz.", Icons.Default.CheckCircle, HomeConstants.AccentColor, HomeConstants.SafeBgColor)

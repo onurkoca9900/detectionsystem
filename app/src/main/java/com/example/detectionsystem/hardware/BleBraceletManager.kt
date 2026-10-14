@@ -3,18 +3,22 @@ package com.example.detectionsystem.hardware
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Handler
+import android.os.Build
 import android.os.Looper
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.UUID
 
 data class BleDeviceChoice(val address: String, val name: String)
 
@@ -30,6 +34,7 @@ data class BleBraceletState(
     val status: BleBraceletStatus = BleBraceletStatus.DISCONNECTED,
     val devices: List<BleDeviceChoice> = emptyList(),
     val connectedName: String? = null,
+    val supportsDirectAlerts: Boolean = false,
     val message: String? = null
 )
 
@@ -41,6 +46,8 @@ class BleBraceletManager(context: Context) {
     private val discoveredDevices = linkedMapOf<String, BluetoothDevice>()
     private var scanner: BluetoothLeScanner? = null
     private var activeGatt: BluetoothGatt? = null
+    private var alertWriteInProgress = false
+    private var pendingAlertLevel: Byte? = null
 
     private val mutableState = MutableStateFlow(BleBraceletState())
     val state: StateFlow<BleBraceletState> = mutableState.asStateFlow()
@@ -68,47 +75,68 @@ class BleBraceletManager(context: Context) {
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (activeGatt !== gatt) {
-                gatt.close()
-                return
-            }
-            if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
-                mutableState.value = mutableState.value.copy(
-                    status = BleBraceletStatus.CONNECTED,
-                    message = "BLE bağlantısı kuruldu."
-                )
-                try {
-                    gatt.discoverServices()
-                } catch (e: SecurityException) {
-                    setError("Bluetooth bağlantı izni gerekiyor.")
+            mainHandler.post {
+                if (activeGatt !== gatt) {
+                    closeGattSafely(gatt)
+                    return@post
                 }
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                mutableState.value = mutableState.value.copy(
-                    status = if (status == BluetoothGatt.GATT_SUCCESS) BleBraceletStatus.DISCONNECTED else BleBraceletStatus.ERROR,
-                    connectedName = null,
-                    message = if (status == BluetoothGatt.GATT_SUCCESS) "Bileklik bağlantısı kesildi." else "BLE bağlantısı kurulamadı (kod: $status)."
-                )
-                gatt.close()
-                if (activeGatt === gatt) activeGatt = null
+                if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
+                    mutableState.value = mutableState.value.copy(
+                        status = BleBraceletStatus.CONNECTED,
+                        message = "BLE bağlantısı kuruldu."
+                    )
+                    try {
+                        if (!gatt.discoverServices()) {
+                            mutableState.value = mutableState.value.copy(message = "Cihaz bağlı; uyarı desteği kontrol edilemedi.")
+                        }
+                    } catch (e: SecurityException) {
+                        setError("Bluetooth bağlantı izni gerekiyor.")
+                    }
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    mutableState.value = mutableState.value.copy(
+                        status = if (status == BluetoothGatt.GATT_SUCCESS) BleBraceletStatus.DISCONNECTED else BleBraceletStatus.ERROR,
+                        connectedName = null,
+                        supportsDirectAlerts = false,
+                        message = if (status == BluetoothGatt.GATT_SUCCESS) "Bileklik bağlantısı kesildi." else "BLE bağlantısı kurulamadı (kod: $status)."
+                    )
+                    closeGattSafely(gatt)
+                    activeGatt = null
+                    alertWriteInProgress = false
+                    pendingAlertLevel = null
+                }
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
+            mainHandler.post {
+                if (activeGatt !== gatt) return@post
+                val supportsAlerts = status == BluetoothGatt.GATT_SUCCESS && getAlertCharacteristic(gatt) != null
                 mutableState.value = mutableState.value.copy(
                     status = BleBraceletStatus.CONNECTED,
-                    message = "BLE bağlantısı kuruldu; ${gatt.services.size} hizmet bulundu."
+                    supportsDirectAlerts = supportsAlerts,
+                    message = when {
+                        status != BluetoothGatt.GATT_SUCCESS -> "BLE bağlantısı kuruldu; hizmet listesi okunamadı."
+                        supportsAlerts -> "Bileklik bağlı. Doğrudan yorgunluk uyarıları destekleniyor."
+                        else -> "Cihaz bağlı; doğrudan uyarı desteklenmiyor. Saat uygulamanızda Smart DMS bildirimlerini açın."
+                    }
                 )
-            } else {
-                mutableState.value = mutableState.value.copy(
-                    status = BleBraceletStatus.CONNECTED,
-                    message = "BLE bağlantısı kuruldu; hizmet listesi okunamadı."
-                )
+            }
+        }
+
+        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            mainHandler.post {
+                if (activeGatt !== gatt || characteristic.uuid != ALERT_LEVEL_UUID) return@post
+                alertWriteInProgress = false
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    mutableState.value = mutableState.value.copy(message = "Bileklik uyarısı gönderilemedi (kod: $status).")
+                }
+                flushPendingAlert()
             }
         }
     }
 
     fun startScan() {
+        closeGatt()
         stopScan(updateStatus = false)
         discoveredDevices.clear()
         mutableState.value = BleBraceletState(
@@ -190,6 +218,7 @@ class BleBraceletManager(context: Context) {
         mutableState.value = mutableState.value.copy(
             status = BleBraceletStatus.CONNECTING,
             connectedName = deviceName,
+            supportsDirectAlerts = false,
             message = "$deviceName cihazına bağlanılıyor…"
         )
 
@@ -209,6 +238,7 @@ class BleBraceletManager(context: Context) {
         mutableState.value = mutableState.value.copy(
             status = BleBraceletStatus.DISCONNECTED,
             connectedName = null,
+            supportsDirectAlerts = false,
             message = "Bileklik bağlantısı kesildi."
         )
     }
@@ -216,6 +246,49 @@ class BleBraceletManager(context: Context) {
     fun close() {
         stopScan(updateStatus = false)
         closeGatt()
+    }
+
+    fun sendFatigueAlert(isDanger: Boolean): Boolean = setAlertLevel(if (isDanger) 2 else 1)
+
+    fun clearFatigueAlert() {
+        setAlertLevel(0)
+    }
+
+    private fun getAlertCharacteristic(gatt: BluetoothGatt): BluetoothGattCharacteristic? {
+        val characteristic = gatt.getService(IMMEDIATE_ALERT_SERVICE_UUID)?.getCharacteristic(ALERT_LEVEL_UUID)
+            ?: return null
+        return characteristic.takeIf {
+            it.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+        }
+    }
+
+    private fun setAlertLevel(level: Int): Boolean {
+        if (!mutableState.value.supportsDirectAlerts || activeGatt == null) return false
+        pendingAlertLevel = level.toByte()
+        return alertWriteInProgress || flushPendingAlert()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun flushPendingAlert(): Boolean {
+        val level = pendingAlertLevel ?: return false
+        val gatt = activeGatt ?: return false
+        val characteristic = getAlertCharacteristic(gatt) ?: return false
+        pendingAlertLevel = null
+        try {
+            val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(characteristic, byteArrayOf(level), BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) == BluetoothStatusCodes.SUCCESS
+            } else {
+                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                characteristic.value = byteArrayOf(level)
+                gatt.writeCharacteristic(characteristic)
+            }
+            alertWriteInProgress = accepted
+            if (!accepted) mutableState.value = mutableState.value.copy(message = "Bileklik uyarısı gönderilemedi.")
+            return accepted
+        } catch (e: SecurityException) {
+            setError("Bileklik uyarısı için Bluetooth bağlantı izni gerekiyor.")
+            return false
+        }
     }
 
     private fun addScanResult(result: ScanResult) {
@@ -243,13 +316,24 @@ class BleBraceletManager(context: Context) {
     }
 
     private fun closeGatt() {
+        val gatt = activeGatt ?: return
+        activeGatt = null
+        alertWriteInProgress = false
+        pendingAlertLevel = null
         try {
-            activeGatt?.disconnect()
-            activeGatt?.close()
+            gatt.disconnect()
         } catch (e: SecurityException) {
             Log.w(TAG, "Bluetooth connection permission was revoked", e)
         } finally {
-            activeGatt = null
+            closeGattSafely(gatt)
+        }
+    }
+
+    private fun closeGattSafely(gatt: BluetoothGatt) {
+        try {
+            gatt.close()
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Bluetooth connection permission was revoked during cleanup", e)
         }
     }
 
@@ -260,5 +344,7 @@ class BleBraceletManager(context: Context) {
     private companion object {
         const val TAG = "BleBraceletManager"
         const val SCAN_DURATION_MS = 12_000L
+        private val IMMEDIATE_ALERT_SERVICE_UUID = UUID.fromString("00001802-0000-1000-8000-00805f9b34fb")
+        private val ALERT_LEVEL_UUID = UUID.fromString("00002a06-0000-1000-8000-00805f9b34fb")
     }
 }
